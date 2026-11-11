@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.tmp
+*.pkl
+.claude/
+
+# Only the networks the game plays with are published; training checkpoints stay local.
+models/*
+!models/expert.pt
+!models/graph.pt
