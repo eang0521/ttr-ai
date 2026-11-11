@@ -143,6 +143,15 @@ python -m unittest discover -s tests
 Training checkpoints from earlier runs aren't included, to keep the download small. The
 training commands are documented at the top of each file in `ttr/ai/`.
 
+## License
+
+The code is released under the [MIT License](LICENSE). The libraries and map data in
+`web/vendor/` keep their own licenses: D3 and topojson-client (ISC), and world-atlas and
+us-atlas (ISC, built from Natural Earth and US Census data).
+
+The license covers this project's own code only, not the *Ticket to Ride* name or game
+content.
+
 ## Disclaimer
 
 This is an unofficial, non-commercial fan project made for learning about game AI. It is
