@@ -23,6 +23,8 @@ are along the bottom.*
 - **Mega Game mode.** It uses all destination tickets in one deck, with mode-specific
   point values and a +15 Globetrotter bonus for completing the most tickets. You're dealt
   5 tickets and keep at least 3; each later draw shows 4 and you keep at least 1.
+- **Other boards.** Besides the USA map, the game can load boards you design yourself
+  (see [Adding your own board](#adding-your-own-board)). Pick the board in the New game dialog.
 - **Five bot levels:**
 
   | Level | How it plays |
@@ -139,9 +141,40 @@ python -m unittest discover -s tests
 | `ttr/ai/evaluate.py` | Win rate of a network against a bot or another network |
 | `ttr/arena.py` | Bot-against-bot matches, e.g. `python -m ttr.arena hard medium --games 200` |
 | `models/` | `expert.pt` (the game's Expert and Master) and `graph.pt` (the graph network) |
+| `ttr/local_boards/` | Your own boards (not part of the repository; see below) |
 
 Training checkpoints from earlier runs aren't included, to keep the download small. The
 training commands are documented at the top of each file in `ttr/ai/`.
+
+## Adding your own board
+
+Put a Python file in `ttr/local_boards/`, for example `ttr/local_boards/my_town.py`. Git
+ignores this folder, so a map of your own neighborhood stays on your computer. The file
+lists the board in plain data:
+
+```python
+TITLE = "My Town"
+SIZE = (2000, 1500)                      # drawing size; positions below use these units
+CITIES = {"Library": (300, 400), "Park": (900, 350), "Station": (700, 1100)}
+ROUTES = [                               # (city, city, length, color)
+    ("Library", "Park", 4, "red"),
+    ("Park", "Station", 5, ("blue", "gray")),  # two colors = a double route
+    ("Library", "Station", 6, "gray"),         # gray = any one color
+]
+TICKETS = [("Library", "Station", 6)]    # (city, city, points)
+```
+
+Colors are the card colors: purple, white, blue, yellow, orange, black, red, green, or gray.
+Optional settings, all described in `board_from_spec` in `ttr/data.py`:
+- `TRAINS` (default 45);
+- custom color names and fills;
+- where each city's name sits;
+- background parks and roads;
+- hand-tuned route curves.
+
+On any board you can play the Easy, Medium and Hard bots. The Expert and Master need a board
+with exactly 36 cities and 100 routes (the USA board's size); there they play with the
+board-independent graph network.
 
 ## License
 

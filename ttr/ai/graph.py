@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from ..data import ROUTES, TICKETS
+from ..data import BOARDS, ROUTES
 from ..engine import CHOOSE_TICKETS, MAIN, SETUP_TICKETS
 from ..planning import edge_costs, plan, unfinished
 from .encode import ACTION_SIZE, MAXP, NC, PHASES, _network, legal_mask, route_gains
@@ -42,7 +42,8 @@ OFF = {}
 _o = 0
 for _name, _n in [("node", N_CITIES * NODE_F), ("edge", N_ROUTES * EDGE_F), ("glob", GLOB_F),
                   ("held", HELD * (HELD_F + 2)), ("pend", PEND_OLD * (PEND_F + 2)),
-                  ("pend2", (PEND - PEND_OLD) * (PEND_F + 2)), ("mode", MODE_F)]:
+                  ("pend2", (PEND - PEND_OLD) * (PEND_F + 2)), ("mode", MODE_F),
+                  ("board", 1)]:
     OFF[_name] = _o
     _o += _n
 OBS_SIZE = _o
@@ -50,17 +51,31 @@ OBS_SIZE = _o
 STATIC_F = MAX_LEN + NC + 2
 
 
-def board_tensors():
-    """What never changes about the board: each route's two cities and its fixed traits."""
-    ea = torch.tensor([r.a for r in ROUTES])
-    eb = torch.tensor([r.b for r in ROUTES])
-    static = torch.zeros(N_ROUTES, STATIC_F)
-    for r in ROUTES:
-        static[r.id, r.length - 1] = 1
-        static[r.id, MAX_LEN + (8 if r.color < 0 else r.color)] = 1
-        static[r.id, MAX_LEN + NC] = 1 if r.pair is not None else 0
-        static[r.id, MAX_LEN + NC + 1] = r.length / 6
-    return ea, eb, static
+_TENSORS = {}
+
+
+def board_tensors(index=0):
+    """What never changes about a board: each route's two cities and its fixed traits, and
+    1 / each city's number of routes. `index` is Board.index (0 = USA)."""
+    if index not in _TENSORS:
+        board = next(b for b in BOARDS.values() if b.index == index)
+        routes = board.routes
+        ea = torch.tensor([r.a for r in routes])
+        eb = torch.tensor([r.b for r in routes])
+        static = torch.zeros(N_ROUTES, STATIC_F)
+        for r in routes:
+            static[r.id, r.length - 1] = 1
+            static[r.id, MAX_LEN + (8 if r.color < 0 else r.color)] = 1
+            static[r.id, MAX_LEN + NC] = 1 if r.pair is not None else 0
+            static[r.id, MAX_LEN + NC + 1] = r.length / 6
+        deg = torch.zeros(N_CITIES).index_add_(0, ea, torch.ones(N_ROUTES)).index_add_(0, eb, torch.ones(N_ROUTES))
+        _TENSORS[index] = (ea, eb, static, (1 / deg.clamp(min=1)).view(1, -1, 1))
+    return _TENSORS[index]
+
+
+def fits(board):
+    """This network's layout has room for exactly N_CITIES cities and N_ROUTES routes."""
+    return len(board.city_names) == N_CITIES and len(board.routes) == N_ROUTES
 
 
 def encode(game, pi):
@@ -68,6 +83,10 @@ def encode(game, pi):
     n = game.num_players
     me = game.players[pi]
     owner = game.route_owner
+    board = game.board
+    if not fits(board):
+        raise ValueError(f"the graph network needs {N_CITIES} cities and {N_ROUTES} routes")
+    routes, tickets = board.routes, board.tickets
     node = np.zeros((N_CITIES, NODE_F), np.float32)
     edge = np.zeros((N_ROUTES, EDGE_F), np.float32)
     glob = np.zeros(GLOB_F, np.float32)
@@ -83,7 +102,7 @@ def encode(game, pi):
     # Routes: who owns them (seats counted from me), whether I can use them, my plan, ...
     hand = me.hand
     best_color = max(hand[:8])
-    for r in ROUTES:
+    for r in routes:
         w = owner[r.id]
         if w == -1:
             if game.route_open_to(r.id, pi):
@@ -97,14 +116,14 @@ def encode(game, pi):
         rid = best_rid.get(key)
         if rid is not None:
             edge[rid, 6] = 1
-            r = ROUTES[rid]
+            r = routes[rid]
             node[r.a, 11] = node[r.b, 11] = 1
     for rid, _ in claims:
         edge[rid, 7] = 1
 
     # Cities: ticket ends, whose networks reach them, how far a path can run from them.
     for t in me.tickets:
-        a, b, pts = TICKETS[t]
+        a, b, pts = tickets[t]
         for c in (a, b):
             if t in todo:
                 node[c, 0] += pts / 22
@@ -112,17 +131,17 @@ def encode(game, pi):
             else:
                 node[c, 2] = 1
     for t in me.pending:
-        a, b, _ = TICKETS[t]
+        a, b, _ = tickets[t]
         node[a, 3] = node[b, 3] = 1
     longest = []
     for j in range(n):
         q = game.players[(pi + j) % n]
         for rid in q.routes:
-            r = ROUTES[rid]
+            r = routes[rid]
             node[r.a, 4 + j] = node[r.b, 4 + j] = 1
         best, gain = route_gains(game, q.index)
         longest.append(best)
-        start = _network(tuple(q.routes))[1]
+        start = _network(board.key, tuple(q.routes))[1]
         col = 9 if j == 0 else 10
         for c, s in start.items():
             node[c, col] = max(node[c, col], s / 45)
@@ -149,7 +168,7 @@ def encode(game, pi):
     for key in needed:
         rid = best_rid.get(key)
         if rid is not None:
-            r = ROUTES[rid]
+            r = routes[rid]
             glob[o + (8 if r.color < 0 else r.color)] += r.length / 20
     o += 9
     glob[o + PHASES.index(game.phase)] = 1
@@ -172,13 +191,13 @@ def encode(game, pi):
 
     # Tickets as things in themselves: points, what's left to build, where they go.
     for k, t in enumerate(me.tickets[:HELD]):
-        a, b, pts = TICKETS[t]
+        a, b, pts = tickets[t]
         done = t not in todo
         held[k, :HELD_F] = (1, pts / 22, done, 0 if done else min(1, tcost.get(t, 45) / 45),
                             0 if done or t in tcost else 1)
         held[k, HELD_F:] = (a, b)
     for k, t in enumerate(me.pending[:PEND]):
-        a, b, pts = TICKETS[t]
+        a, b, pts = tickets[t]
         _, tot2, ok2, _, _ = plan(game, pi, todo + [t], costs)
         pend[k, :PEND_F] = (1, pts / 22, (tot2 - total) / 45, 1 if t in ok2 else 0)
         pend[k, PEND_F:] = (a, b)
@@ -191,7 +210,9 @@ def encode(game, pi):
                len(todo) / 10, game.min_keep() / 3 if choosing else 0, len(me.pending) / 5,
                len(game.ticket_deck) / universe, universe / 100)
 
-    obs = np.concatenate([node.ravel(), edge.ravel(), glob, held.ravel(), pend.ravel(), mode])
+    # Which board (not an input to any layer: it picks the map the messages run over).
+    obs = np.concatenate([node.ravel(), edge.ravel(), glob, held.ravel(), pend.ravel(), mode,
+                          np.array([board.index], np.float32)])
     return obs, legal_mask(game, pi, claims)
 
 
@@ -236,12 +257,6 @@ class GraphNet(nn.Module):
     def __init__(self, d=96, layers=4):
         super().__init__()
         self.config = {"kind": "graph", "d": d, "layers": layers}
-        ea, eb, static = board_tensors()
-        self.register_buffer("ea", ea, persistent=False)
-        self.register_buffer("eb", eb, persistent=False)
-        self.register_buffer("static", static, persistent=False)
-        deg = torch.zeros(N_CITIES).index_add_(0, ea, torch.ones(N_ROUTES)).index_add_(0, eb, torch.ones(N_ROUTES))
-        self.register_buffer("inv_deg", (1 / deg.clamp(min=1)).view(1, -1, 1), persistent=False)
         subsets = torch.tensor([[(m >> k) & 1 for k in range(PEND)] for m in range(1, 2 ** PEND)],
                                dtype=torch.float32)
         self.register_buffer("subsets", subsets, persistent=False)
@@ -261,19 +276,33 @@ class GraphNet(nn.Module):
         self.value_head = _mlp(3 * d, 1, 2 * d)
 
     def forward(self, obs, mask):
+        ids = obs[:, OFF["board"]]
+        first = int(ids[0])
+        if bool((ids == first).all()):
+            return self._forward(obs, mask, board_tensors(first))
+        # Positions from different boards: run each board's share separately.
+        logits = obs.new_empty(obs.shape[0], ACTION_SIZE)
+        value = obs.new_empty(obs.shape[0])
+        for b in ids.unique():
+            sel = ids == b
+            logits[sel], value[sel] = self._forward(obs[sel], mask[sel], board_tensors(int(b)))
+        return logits, value
+
+    def _forward(self, obs, mask, tensors):
+        ea, eb, static, inv_deg = tensors
         B = obs.shape[0]
         node = obs[:, OFF["node"]:OFF["edge"]].view(B, N_CITIES, NODE_F)
         edge = obs[:, OFF["edge"]:OFF["glob"]].view(B, N_ROUTES, EDGE_F)
         glob = obs[:, OFF["glob"]:OFF["held"]]
         held = obs[:, OFF["held"]:OFF["pend"]].view(B, HELD, HELD_F + 2)
         pend = obs[:, OFF["pend"]:OFF["mode"]].view(B, PEND, PEND_F + 2)
-        mode = obs[:, OFF["mode"]:]
+        mode = obs[:, OFF["mode"]:OFF["board"]]
 
         h = self.node_in(node)
-        e = self.edge_in(torch.cat([edge, self.static.expand(B, -1, -1)], -1))
+        e = self.edge_in(torch.cat([edge, static.expand(B, -1, -1)], -1))
         g = self.glob_in(glob) + self.mode_in(mode)
         for layer in self.layers:
-            h, e, g = layer(h, e, g, self.ea, self.eb, self.inv_deg)
+            h, e, g = layer(h, e, g, ea, eb, inv_deg)
 
         def ends(tokens, f):
             idx = tokens[:, :, f:f + 2].long()

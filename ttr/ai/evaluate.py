@@ -25,14 +25,15 @@ def _init(path, opponent):
 
 def _play(args):
     from .model import NNBot
-    seed, opponent, players, *rest = args  # (a training run started before modes sends 3)
+    seed, opponent, players, *rest = args  # (older training runs send fewer fields)
     mode = rest[0] if rest else "standard"
+    board = rest[1] if len(rest) > 1 else "usa"
     # Rotate the network's seat so it isn't always first.
     nn_seat = seed % players
     bots = [NNBot(_net) if i == nn_seat else
             NNBot(_opp) if _opp is not None else make_bot(opponent, seed=seed * 11 + i)
             for i in range(players)]
-    g = Game(players, seed=seed, mode=mode)
+    g = Game(players, seed=seed, mode=mode, board=board)
     while g.phase != GAME_OVER:
         pi = g.current
         g.step(bots[pi].choose(g, pi), validate=False)
@@ -43,10 +44,12 @@ def _play(args):
     return win, scores[nn_seat], sum(others) / len(others)
 
 
-def evaluate(path, opponent="hard", games=400, players=2, workers=14, seed=777_000, mode="standard"):
+def evaluate(path, opponent="hard", games=400, players=2, workers=14, seed=777_000, mode="standard",
+             board="usa"):
     opponent = str(opponent)
     with Pool(workers, initializer=_init, initargs=(str(path), opponent)) as pool:
-        results = pool.map(_play, [(seed + i, opponent, players, mode) for i in range(games)], chunksize=4)
+        results = pool.map(_play, [(seed + i, opponent, players, mode, board) for i in range(games)],
+                           chunksize=4)
     wins = sum(r[0] for r in results)
     return {
         "win_rate": wins / games,
@@ -62,9 +65,10 @@ def main():
     ap.add_argument("--vs", default="hard")
     ap.add_argument("--games", type=int, default=400)
     ap.add_argument("--players", type=int, default=2)
+    ap.add_argument("--board", default="usa")
     args = ap.parse_args()
     t = time.time()
-    r = evaluate(args.model, args.vs, args.games, args.players)
+    r = evaluate(args.model, args.vs, args.games, args.players, board=args.board)
     print(f"vs {args.vs} ({args.players}p): win {100 * r['win_rate']:.1f}%  "
           f"score {r['nn_score']:.1f} vs {r['opp_score']:.1f}  ({time.time() - t:.0f}s)")
 

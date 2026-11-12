@@ -1,18 +1,22 @@
 'use strict';
 
-// The board uses the official board's proportions (see board_layout.js).
-const W = 1400, BOARD_SCALE = W / BOARD_SIZE[0], H = Math.round(BOARD_SIZE[1] * BOARD_SCALE);
+// The drawing is W wide; its height and scale follow the board on show (drawBoard). The USA
+// board uses the official board's proportions (see board_layout.js); other boards bring
+// their own size, city positions and landmarks from the server.
+const W = 1400;
+let BOARD_SCALE = W / BOARD_SIZE[0], H = Math.round(BOARD_SIZE[1] * BOARD_SCALE);
 const CARD_TYPES = ['purple', 'white', 'blue', 'yellow', 'orange', 'black', 'red', 'green', 'locomotive'];
 const LOCO = 8;
-const ROUTE_FILL = {
+const BASE_ROUTE_FILL = {
   purple: '#b05fb5', white: '#f3f1ea', blue: '#2f74c0', yellow: '#f0c93a', orange: '#ec8a2c',
   black: '#2a2a2a', red: '#d13b35', green: '#3d9a4a', gray: '#a5a39c',
 };
+let ROUTE_FILL = { ...BASE_ROUTE_FILL };
 const PLAYER_FILL = { red: '#b8312f', blue: '#2457a8', green: '#23854a', yellow: '#e2b417', purple: '#6a3d9a' };
 const ROUTE_POINTS = { 1: 1, 2: 2, 3: 4, 4: 7, 5: 10, 6: 15 };
 const CITY_R = 9;
 const CAR_H = 11;
-const CAR_PITCH = 48;  // length of every train spot, including the gap to the next one
+let CAR_PITCH = 48;  // length of every train spot, including the gap to the next one (per board)
 const DOUBLE_GAP = 6.5;
 
 // Label placement [dx, dy, anchor], roughly where the official board prints each name.
@@ -46,14 +50,42 @@ let cityPos = {};
 
 // ------------------------------------------------------------------ board
 
+const isUSA = () => MAP.layout === 'geo';
+
+/** Card color name as this board shows it (e.g. "pink" for purple on some boards). */
+function colorLabel(c) {
+  const style = MAP && MAP.color_style && MAP.color_style[c];
+  return style ? style[0].toLowerCase() : c;
+}
+
+/** Load the board a game is played on, restyle the cards and redraw the map. */
+async function loadBoard(key) {
+  MAP = await api.get(`/api/map?board=${encodeURIComponent(key || 'usa')}`);
+  document.body.classList.toggle('local-board', !isUSA());
+  ROUTE_FILL = { ...BASE_ROUTE_FILL };
+  const root = document.documentElement.style;
+  for (const c of CARD_TYPES.slice(0, 8)) {
+    const style = MAP.color_style[c];
+    ROUTE_FILL[c] = style ? style[1] : BASE_ROUTE_FILL[c];
+    root.setProperty(`--${c}`, ROUTE_FILL[c]);
+  }
+  await drawBoard();
+}
+
 async function drawBoard() {
-  const [world, us] = await Promise.all([
-    api.get('vendor/countries-50m.json'), api.get('vendor/states-10m.json'),
-  ]);
+  const usa = isUSA();
+  const size = usa ? BOARD_SIZE : MAP.size;
+  BOARD_SCALE = W / size[0];
+  H = Math.round(size[1] * BOARD_SCALE);
+  CAR_PITCH = usa ? 48 : (MAP.ui.car_pitch || 48);
+  cityPos = {};
   const svg = d3.select('#board').attr('viewBox', `0 0 ${W} ${H}`);
-  for (const [name, [x, y]] of Object.entries(BOARD_CITIES)) cityPos[name] = [x * BOARD_SCALE, y * BOARD_SCALE];
-  const warp = boardWarp();
-  const path = d3.geoPath(d3.geoTransform({ point(lon, lat) { this.stream.point(...warp(lon, lat)); } }));
+  svg.selectAll('*').remove();
+  if (usa) {
+    for (const [name, [x, y]] of Object.entries(BOARD_CITIES)) cityPos[name] = [x * BOARD_SCALE, y * BOARD_SCALE];
+  } else {
+    for (const c of MAP.cities) cityPos[c.name] = [c.x * BOARD_SCALE, c.y * BOARD_SCALE];
+  }
 
   const defs = svg.append('defs');
   defs.append('clipPath').attr('id', 'boardClip').append('rect').attr('width', W).attr('height', H);
@@ -80,19 +112,8 @@ async function drawBoard() {
   ['#d13b35', '#ec8a2c', '#f0c93a', '#3d9a4a', '#2f74c0', '#b05fb5'].forEach((c, i, a) =>
     rainbow.append('stop').attr('offset', `${(100 * i) / (a.length - 1)}%`).attr('stop-color', c));
 
-  // Sea, then land warped so real coastlines and borders sit where the board draws them.
-  svg.append('rect').attr('width', W).attr('height', H).attr('fill', '#9fbfc4');
-  const geo = svg.append('g').attr('clip-path', 'url(#boardClip)');
-  const NEIGHBORS = new Set(['124', '484', '192', '044']);  // Canada, Mexico, Cuba, Bahamas
-  const countries = topojson.feature(world, world.objects.countries).features;
-  geo.append('g').selectAll('path').data(countries.filter(f => NEIGHBORS.has(f.id))).join('path')
-    .attr('d', path).attr('fill', '#e3d3a6').attr('stroke', '#8f7a52').attr('stroke-width', 0.8);
-  const states = topojson.feature(us, us.objects.states).features
-    .filter(f => !['02', '15', '72', '78', '60', '66', '69'].includes(f.id));  // no AK, HI, territories
-  geo.append('g').selectAll('path').data(states).join('path')
-    .attr('d', path).attr('fill', '#f1e2b9');
-  geo.append('path').datum(topojson.mesh(us, us.objects.states, (a, b) => a !== b)).attr('d', path)
-    .attr('fill', 'none').attr('stroke', '#b39b6a').attr('stroke-width', 0.8).attr('stroke-dasharray', '3 2');
+  if (usa) await drawUSABackground(svg);
+  else drawLocalBackground(svg);
   svg.append('rect').attr('width', W).attr('height', H).attr('filter', 'url(#paper)').attr('pointer-events', 'none');
   svg.append('rect').attr('width', W).attr('height', H).attr('fill', 'url(#vignette)').attr('pointer-events', 'none');
   drawCompass(svg);
@@ -123,12 +144,64 @@ async function drawBoard() {
     .attr('transform', c => `translate(${cityPos[c.name]})`);
   cg.append('circle').attr('class', 'halo').attr('r', CITY_R + 5);
   cg.append('circle').attr('class', 'dot').attr('r', CITY_R);
+  const labels = usa ? LABELS : (MAP.ui.labels || {});
   cityLayer.selectAll('text').data(MAP.cities).join('text')
     .attr('class', 'city-label').attr('data-name', c => c.name)
-    .attr('x', c => cityPos[c.name][0] + (LABELS[c.name] || [12])[0])
-    .attr('y', c => cityPos[c.name][1] + (LABELS[c.name] || [12, 4])[1])
-    .attr('text-anchor', c => (LABELS[c.name] || [0, 0, 'start'])[2])
+    .attr('x', c => cityPos[c.name][0] + (labels[c.name] || [12])[0])
+    .attr('y', c => cityPos[c.name][1] + (labels[c.name] || [12, 4])[1])
+    .attr('text-anchor', c => (labels[c.name] || [0, 0, 'start'])[2])
     .text(c => c.name);
+}
+
+/** USA: sea, then land warped so real coastlines and borders sit where the board draws them. */
+async function drawUSABackground(svg) {
+  const [world, us] = await Promise.all([
+    api.get('vendor/countries-50m.json'), api.get('vendor/states-10m.json'),
+  ]);
+  const warp = boardWarp();
+  const path = d3.geoPath(d3.geoTransform({ point(lon, lat) { this.stream.point(...warp(lon, lat)); } }));
+  svg.append('rect').attr('width', W).attr('height', H).attr('fill', '#9fbfc4');
+  const geo = svg.append('g').attr('clip-path', 'url(#boardClip)');
+  const NEIGHBORS = new Set(['124', '484', '192', '044']);  // Canada, Mexico, Cuba, Bahamas
+  const countries = topojson.feature(world, world.objects.countries).features;
+  geo.append('g').selectAll('path').data(countries.filter(f => NEIGHBORS.has(f.id))).join('path')
+    .attr('d', path).attr('fill', '#e3d3a6').attr('stroke', '#8f7a52').attr('stroke-width', 0.8);
+  const states = topojson.feature(us, us.objects.states).features
+    .filter(f => !['02', '15', '72', '78', '60', '66', '69'].includes(f.id));  // no AK, HI, territories
+  geo.append('g').selectAll('path').data(states).join('path')
+    .attr('d', path).attr('fill', '#f1e2b9');
+  geo.append('path').datum(topojson.mesh(us, us.objects.states, (a, b) => a !== b)).attr('d', path)
+    .attr('fill', 'none').attr('stroke', '#b39b6a').attr('stroke-width', 0.8).attr('stroke-dasharray', '3 2');
+}
+
+/** Other boards: a parchment map with their landmarks (parks, freeways) and title. */
+function drawLocalBackground(svg) {
+  const decor = MAP.ui.decor || {};
+  const at = ([x, y]) => [x * BOARD_SCALE, y * BOARD_SCALE];
+  svg.append('rect').attr('width', W).attr('height', H).attr('fill', '#f1e2b9');
+  const geo = svg.append('g').attr('clip-path', 'url(#boardClip)');
+  const smooth = d3.line().curve(d3.curveCatmullRomClosed.alpha(0.5));
+  for (const park of decor.parks || []) {
+    geo.append('path').attr('d', smooth(park.points.map(at))).attr('fill', '#d6dcae')
+      .attr('stroke', '#a9b07a').attr('stroke-width', 1.2).attr('stroke-dasharray', '4 3').attr('opacity', 0.85);
+    geo.append('text').attr('class', 'map-note').attr('text-anchor', 'middle')
+      .attr('x', at(park.label)[0]).attr('y', at(park.label)[1]).text(park.name);
+  }
+  const road = d3.line().curve(d3.curveCatmullRom.alpha(0.5));
+  for (const r of decor.roads || []) {
+    const d = road(r.points.map(at));
+    geo.append('path').attr('d', d).attr('fill', 'none').attr('stroke', '#c7b183').attr('stroke-width', 7)
+      .attr('stroke-linecap', 'round').attr('opacity', 0.7);
+    geo.append('path').attr('d', d).attr('fill', 'none').attr('stroke', '#f6ecd0').attr('stroke-width', 2.5)
+      .attr('stroke-linecap', 'round').attr('opacity', 0.8);
+  }
+  for (const r of decor.roads || []) {
+    const [x, y] = at(r.label);
+    const shield = geo.append('g').attr('class', 'road-shield').attr('transform', `translate(${x},${y})`);
+    shield.append('rect').attr('x', -15).attr('y', -10).attr('width', 30).attr('height', 20).attr('rx', 5);
+    shield.append('text').attr('text-anchor', 'middle').attr('y', 5).text(r.name);
+  }
+  svg.append('text').attr('class', 'board-title').attr('x', 24).attr('y', 44).text(MAP.title);
 }
 
 /**
@@ -189,11 +262,55 @@ function drawCompass(svg) {
   g.append('text').attr('y', -58).attr('text-anchor', 'middle').attr('class', 'city-label').text('N');
 }
 
+/** [bend, side, shift, via, ends] for a route on a board without a hand-made USA-style
+ * layout. The board's SHAPES may give a route's bend (board units the curve bows to the
+ * left of the line from its first city), a zigzag `via` [o1, o2] instead, and `ends`
+ * [e1, e2]: extra room (screen pixels) between each end city and the first spot.
+ * Otherwise a route is curved just enough for its spots, bowing away from other cities. */
+function autoShape(r) {
+  const side = r.pair === null ? 0 : (r.id < r.pair ? -1 : 1);
+  let drawn = (MAP.ui.shapes || {})[`${r.a}|${r.b}`];
+  if (typeof drawn === 'number') drawn = { bend: drawn };
+  const bend = drawn && drawn.bend !== undefined ? drawn.bend : (drawn && drawn.via ? 0 : fitBend(r));
+  return [bend, side, 0, drawn ? drawn.via : undefined, drawn ? drawn.ends : undefined];
+}
+
+/** The bend (board units) that makes a route just long enough for its spots, if needed. */
+function fitBend(r) {
+  const A = cityPos[r.a], B = cityPos[r.b];
+  const dx = B[0] - A[0], dy = B[1] - A[1], len = Math.hypot(dx, dy);
+  const nx = -dy / len, ny = dx / len;
+  const need = 2 * (CITY_R + 3) + CAR_PITCH * r.length + 4;
+  const curveLen = h => {  // length of the quadratic curve with its control point h off the middle
+    let total = 0, prev = A;
+    for (let i = 1; i <= 40; i++) {
+      const t = i / 40, u = 1 - t;
+      const p = [u * u * A[0] + 2 * u * t * ((A[0] + B[0]) / 2 + nx * h) + t * t * B[0],
+                 u * u * A[1] + 2 * u * t * ((A[1] + B[1]) / 2 + ny * h) + t * t * B[1]];
+      total += Math.hypot(p[0] - prev[0], p[1] - prev[1]);
+      prev = p;
+    }
+    return total;
+  };
+  if (len >= need) return 0;
+  let lo = 0, hi = len;
+  for (let i = 0; i < 30; i++) { const m = (lo + hi) / 2; if (curveLen(m) < need) lo = m; else hi = m; }
+  // Bow toward whichever side keeps the curve's middle further from other cities.
+  const clearance = sign => {
+    const m = [(A[0] + B[0]) / 2 + nx * hi * sign / 2, (A[1] + B[1]) / 2 + ny * hi * sign / 2];
+    return d3.min(MAP.cities.filter(c => c.name !== r.a && c.name !== r.b),
+                  c => Math.hypot(cityPos[c.name][0] - m[0], cityPos[c.name][1] - m[1]));
+  };
+  const sign = clearance(1) >= clearance(-1) ? 1 : -1;
+  return sign * hi / BOARD_SCALE;
+}
+
 function routeGeometry(r) {
   const A = cityPos[r.a], B = cityPos[r.b];
   const dx = B[0] - A[0], dy = B[1] - A[1], len = Math.hypot(dx, dy);
   const nx = -dy / len, ny = dx / len;
-  const [boardBend, side, shift, via] = BOARD_ROUTES[r.id];
+  const usa = isUSA();
+  const [boardBend, side, shift, via, ends] = usa ? BOARD_ROUTES[r.id] : autoShape(r);
   // The route's center line; each half of a double route runs parallel to it, so the two
   // halves' spots line up side by side.
   const mid = [];
@@ -244,8 +361,16 @@ function routeGeometry(r) {
     return { x, y, angle };
   };
   const cars = [];
+  // USA: spots packed together, spare length at the ends. Other boards: spots spread
+  // evenly along the route, like the dashes on a hand-drawn board.
+  // Where there's room, keep spots a little further from the cities so routes leaving a
+  // city at a narrow angle don't touch (the board's SHAPES can set each end's gap).
+  let [e1, e2] = ends || [Math.min(slack / 2, CAR_PITCH * 0.6), Math.min(slack / 2, CAR_PITCH * 0.6)];
+  if (e1 + e2 > slack) { const f = slack / (e1 + e2 || 1); e1 *= f; e2 *= f; }  // spots never shrink
+  const pitch = usa ? CAR_PITCH : (total - 2 * trim - e1 - e2) / r.length;
+  const start = usa ? first : trim + e1;
   for (let k = 0; k < r.length; k++) {
-    cars.push({ ...at(first + CAR_PITCH * (k + 0.5)), w: CAR_PITCH - 3 });
+    cars.push({ ...at(start + pitch * (k + 0.5)), w: CAR_PITCH - 3 });
   }
   return { cars, hitPath: d3.line()(pts) };
 }
@@ -253,7 +378,7 @@ function routeGeometry(r) {
 function routeTooltip(r) {
   let owner = '';
   if (state && state.route_owner[r.id] !== -1) owner = ` · claimed by ${state.players[state.route_owner[r.id]].name}`;
-  return `<b>${r.a} – ${r.b}</b><br>${r.length} ${r.color === 'gray' ? 'gray (any one color)' : r.color} · ${ROUTE_POINTS[r.length]} pts${owner}`;
+  return `<b>${r.a} – ${r.b}</b><br>${r.length} ${r.color === 'gray' ? 'gray (any one color)' : colorLabel(r.color)} · ${ROUTE_POINTS[r.length]} pts${owner}`;
 }
 
 function showTooltip(e, html) {
@@ -279,6 +404,7 @@ function toast(msg) {
 async function refresh() {
   let s = await api.get('/api/state' + (viewer !== null ? `?viewer=${viewer}` : ''));
   if (s.no_game) { state = null; render(); showNewGame(); return; }
+  if ((s.board || 'usa') !== MAP.board) await loadBoard(s.board);
   const humans = s.players.filter(p => p.type === 'human').map(p => p.index);
   let want;
   if (s.phase !== 'game_over' && humans.includes(s.current)) want = s.current;
@@ -547,7 +673,7 @@ function renderStatus() {
   else if (state.phase === 'setup_tickets') text = `${cur.name}: choose your starting destination tickets.`;
   else if (state.phase === 'choose_tickets') text = `${cur.name}: choose which tickets to keep.`;
   else if (state.phase === 'second_draw') text = `${cur.name}: draw one more train card (no face-up locomotive).`;
-  else if (payColor !== null) text = `Paying with ${CARD_TYPES[payColor]}: click a highlighted route (click the card again to cancel).`;
+  else if (payColor !== null) text = `Paying with ${colorLabel(CARD_TYPES[payColor])}: click a highlighted route (click the card again to cancel).`;
   else text = `${cur.name}: draw cards, claim a route, or draw destination tickets.`;
   el.innerHTML = text + (state.final_turns_left !== null && state.phase !== 'game_over'
     ? `<span class="final">Final round – ${state.final_turns_left} turn${state.final_turns_left === 1 ? '' : 's'} left</span>` : '');
@@ -572,13 +698,13 @@ function renderPlayers() {
 }
 
 function chipHtml(i, n) {
-  return `<span class="chip c-${CARD_TYPES[i]}" title="${CARD_TYPES[i]}">${n}</span>`;
+  return `<span class="chip c-${CARD_TYPES[i]}" title="${colorLabel(CARD_TYPES[i])}">${n}</span>`;
 }
 
 function cardEl(type, opts = {}) {
   const d = document.createElement('div');
   d.className = `card c-${type} ${type}`;
-  d.textContent = type === 'locomotive' ? 'LOCO' : type.toUpperCase();
+  d.textContent = type === 'locomotive' ? 'LOCO' : colorLabel(type).toUpperCase();
   if (opts.count !== undefined) {
     const c = document.createElement('span');
     c.className = 'count';
@@ -780,7 +906,7 @@ function onRouteClick(r) {
   if (payColor !== null) {
     // Card chosen first: claim straight away with it.
     const opt = opts.find(([c]) => c === payColor);
-    if (!opt) { toast(`You can’t pay for ${r.a} – ${r.b} with ${CARD_TYPES[payColor]} cards.`); return; }
+    if (!opt) { toast(`You can’t pay for ${r.a} – ${r.b} with ${colorLabel(CARD_TYPES[payColor])} cards.`); return; }
     payColor = null;
     act(['claim', r.id, ...opt]);
     return;
@@ -790,7 +916,7 @@ function onRouteClick(r) {
     const chips = (color === LOCO ? [] : Array(n).fill(color)).concat(Array(color === LOCO ? r.length : locos).fill(LOCO))
       .map(c => `<span class="chip c-${CARD_TYPES[c]}"></span>`).join('');
     const label = color === LOCO ? `${r.length} locomotives`
-      : `${n} ${CARD_TYPES[color]}${locos ? ` + ${locos} locomotive${locos > 1 ? 's' : ''}` : ''}`;
+      : `${n} ${colorLabel(CARD_TYPES[color])}${locos ? ` + ${locos} locomotive${locos > 1 ? 's' : ''}` : ''}`;
     return `<button class="btn secondary pay-option" data-i="${i}">${chips}<span>${label}</span></button>`;
   }).join('');
   openModal('claim', `
@@ -817,7 +943,7 @@ function whyNot(r) {
   if (me.trains < r.length) return `You only have ${me.trains} trains left.`;
   return r.color === 'gray'
     ? `You need ${r.length} cards of one color (locomotives are wild).`
-    : `You need ${r.length} ${r.color} cards (locomotives are wild).`;
+    : `You need ${r.length} ${colorLabel(r.color)} cards (locomotives are wild).`;
 }
 
 function showGameOver() {
@@ -845,24 +971,28 @@ function showGameOver() {
   $('#againBtn').onclick = showNewGame;
 }
 
+const MODE_NAMES = { standard: 'Standard', mega: 'Mega Game (all tickets, Globetrotter bonus)' };
+
 function showNewGame() {
   const defaults = [['You', 'human'], ['Bot 1', 'medium'], ['Bot 2', 'medium'], ['Bot 3', 'medium'], ['Bot 4', 'medium']];
-  const typeOptions = ['human', ...MAP.bot_levels];
+  const levelName = t => (t === 'human' ? 'Human' : `Bot – ${t[0].toUpperCase()}${t.slice(1)}`);
   const seatRow = i => `
     <div class="row seat" data-i="${i}">
       <span class="seat-swatch" style="background:${PLAYER_FILL[MAP.player_colors[i]]}"></span>
       <input class="seat-name" value="${defaults[i][0]}" maxlength="16" size="12">
-      <select class="seat-type">${typeOptions.map(t => `<option value="${t}" ${t === defaults[i][1] ? 'selected' : ''}>
-        ${t === 'human' ? 'Human' : `Bot – ${t[0].toUpperCase()}${t.slice(1)}`}</option>`).join('')}</select>
+      <select class="seat-type"></select>
     </div>`;
   openModal('newgame', `
     <h2>New game</h2>
+    <div class="row">Board:
+      <select id="boardPick">${MAP.boards.map(b => `<option value="${b.key}" ${b.key === MAP.board ? 'selected' : ''}>
+        ${esc(b.title)}</option>`).join('')}</select>
+    </div>
     <div class="row">Players:
       <select id="numPlayers">${[2, 3, 4, 5].map(n => `<option ${n === 2 ? 'selected' : ''}>${n}</option>`).join('')}</select>
     </div>
-    <div class="row">Game:
-      <select id="gameMode"><option value="standard">Standard</option>
-        <option value="mega">Mega Game (all tickets, Globetrotter bonus)</option></select>
+    <div class="row" id="modeRow">Game:
+      <select id="gameMode"></select>
     </div>
     <div id="seats">${[0, 1, 2, 3, 4].map(seatRow).join('')}</div>
     <label class="row"><input type="checkbox" id="randomOrder"> Random turn order</label>
@@ -872,8 +1002,21 @@ function showNewGame() {
     const n = +$('#numPlayers').value;
     document.querySelectorAll('#seats .seat').forEach((el, i) => el.classList.toggle('hidden', i >= n));
   };
+  // The board decides which game modes and bot levels are on offer.
+  const syncBoard = () => {
+    const b = MAP.boards.find(x => x.key === $('#boardPick').value);
+    $('#gameMode').innerHTML = b.modes.map(m => `<option value="${m}">${MODE_NAMES[m] || m}</option>`).join('');
+    $('#modeRow').classList.toggle('hidden', b.modes.length < 2);
+    document.querySelectorAll('#seats .seat-type').forEach((sel, i) => {
+      const keep = sel.value || defaults[i][1];
+      const options = ['human', ...b.bot_levels];
+      sel.innerHTML = options.map(t => `<option value="${t}" ${t === keep ? 'selected' : ''}>${levelName(t)}</option>`).join('');
+    });
+  };
   $('#numPlayers').onchange = sync;
+  $('#boardPick').onchange = syncBoard;
   sync();
+  syncBoard();
   if ($('#cancelNew')) $('#cancelNew').onclick = () => { closeModal(); render(); };
   $('#startBtn').onclick = async () => {
     const n = +$('#numPlayers').value;
@@ -881,7 +1024,12 @@ function showNewGame() {
       name: el.querySelector('.seat-name').value.trim() || `Player ${i + 1}`,
       type: el.querySelector('.seat-type').value,
     }));
-    await api.post('/api/new', { seats, random_order: $('#randomOrder').checked, mode: $('#gameMode').value });
+    const board = $('#boardPick').value;
+    const res = await api.post('/api/new', {
+      seats, board, random_order: $('#randomOrder').checked, mode: $('#gameMode').value || 'standard',
+    });
+    if (res.error) { toast(res.error); return; }
+    if (board !== MAP.board) await loadBoard(board);
     viewer = null; lastHuman = null; revealedFor = null; reviewTurn = null;
     closeModal();
     refresh();
@@ -895,8 +1043,8 @@ function esc(s) {
 // ------------------------------------------------------------------ init
 
 async function init() {
-  MAP = await api.get('/api/map');
-  await drawBoard();
+  const first = await api.get('/api/state');
+  await loadBoard(first.board);
   $('#deckBtn').onclick = () => act(['draw_deck']);
   $('#ticketBtn').onclick = () => act(['draw_tickets']);
   $('#passBtn').onclick = () => act(['pass']);

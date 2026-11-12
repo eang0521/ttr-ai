@@ -8,3 +8,8 @@ __pycache__/
 models/*
 !models/expert.pt
 !models/graph.pt
+
+
+# Personal boards (real local places) and their tests stay on this computer.
+ttr/local_boards/
+tests/local/

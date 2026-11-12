@@ -37,7 +37,6 @@ import torch
 import torch.nn.functional as F
 
 from ..bots import make_bot
-from ..data import ROUTES, TICKETS
 from ..engine import CHOOSE_TICKETS, GAME_OVER, MAIN, SETUP_TICKETS, Game
 from .encode import A_CLAIM, A_DECK, A_FACE, A_KEEP, A_KEEP5, A_TICKETS, ACTION_SIZE, NC, decode, legal_mask
 from .imitate import outcome
@@ -150,7 +149,7 @@ def _block_dist(g, mask, logits):
                 damage[key] = damage.get(key, 0) + d
     best, best_d = None, BLOCK_MIN - 1
     for idx in np.flatnonzero(mask[A_CLAIM:]) + A_CLAIM:
-        r = ROUTES[(idx - A_CLAIM) // NC]
+        r = g.board.routes[(idx - A_CLAIM) // NC]
         d = damage.get((min(r.a, r.b), max(r.a, r.b)), 0)
         if d > best_d:
             best, best_d = r.id, d

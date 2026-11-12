@@ -8,10 +8,11 @@ The one exception is "blocker", a training-only bot that sees opponents' tickets
 
 import random
 from collections import defaultdict
+from pathlib import Path
 
-from .data import GRAY, LOCO, ROUTES, TICKETS
+from .data import GRAY, LOCO
 from .engine import CHOOSE_TICKETS, SECOND_DRAW, SETUP_TICKETS
-from .planning import EDGES, INF, edge_costs, plan, shortest_path, ticket_damage, unfinished
+from .planning import INF, edge_costs, plan, shortest_path, ticket_damage, unfinished
 
 
 class RandomBot:
@@ -115,14 +116,15 @@ class HeuristicBot:
             if hoarding:
                 return ("draw_deck",)
             options = []
+            routes, edges = game.board.routes, game.board.edges
             for key in needed:
-                for rid in EDGES[key]:
+                for rid in edges[key]:
                     if claims.get(rid):
-                        options.append((ROUTES[rid].length + 10, rid))
+                        options.append((routes[rid].length + 10, rid))
             spare = p.trains - need_total
             for rid in claims:
-                if ROUTES[rid].length <= spare:
-                    options.append((ROUTES[rid].length, rid))
+                if routes[rid].length <= spare:
+                    options.append((routes[rid].length, rid))
             if options:
                 rid = max(options)[1]
                 return self._best_payment(game, pi, claims[rid], needed, best_rid)
@@ -130,7 +132,7 @@ class HeuristicBot:
         # 1. Claim a route our tickets need.
         options = []
         for key in needed:
-            for rid in EDGES[key]:
+            for rid in game.board.edges[key]:
                 if claims.get(rid):
                     options.append((self._claim_priority(game, pi, key, rid, costs, needed), rid))
         if options:
@@ -166,8 +168,8 @@ class HeuristicBot:
                 continue
             for key, (dmg, _) in ticket_damage(game, q.index).items():
                 ours = key in needed
-                for rid in EDGES[key]:
-                    L = ROUTES[rid].length
+                for rid in game.board.edges[key]:
+                    L = game.board.routes[rid].length
                     if not claims.get(rid) or (not ours and L > min(budget, spare)):
                         continue
                     if dmg > best_dmg:
@@ -176,11 +178,11 @@ class HeuristicBot:
             return None
         rid, ours = best
         if not ours:
-            self.block_trains += ROUTES[rid].length
+            self.block_trains += game.board.routes[rid].length
         return self._best_payment(game, pi, claims[rid], needed, best_rid)
 
     def _claim_priority(self, game, pi, key, rid, costs, needed):
-        r = ROUTES[rid]
+        r = game.board.routes[rid]
         prio = r.length
         if self.cfg.get("bottleneck"):
             # How much would losing this edge cost us?
@@ -188,7 +190,7 @@ class HeuristicBot:
             blocked[key] = INF
             _, base_total, base_ok, _ = self._plan(game, pi, self._unfinished(game, pi), costs)
             _, alt_total, alt_ok, _ = self._plan(game, pi, self._unfinished(game, pi), blocked)
-            lost_points = sum(TICKETS[t][2] for t in base_ok if t not in alt_ok)
+            lost_points = sum(game.board.tickets[t][2] for t in base_ok if t not in alt_ok)
             prio += 2 * lost_points + 0.5 * max(0, alt_total - base_total)
         if self.cfg.get("threat") and r.color != GRAY:
             # An opponent visibly collecting this color.
@@ -206,7 +208,7 @@ class HeuristicBot:
             _, rid, color, n_locos = a
             if color == LOCO:
                 return (100, 0)
-            leftover = hand[color] - (ROUTES[rid].length - n_locos)
+            leftover = hand[color] - (game.board.routes[rid].length - n_locos)
             return (n_locos * 10 + demand[color], leftover)
 
         return min(actions, key=cost)
@@ -214,19 +216,21 @@ class HeuristicBot:
     def _color_demand(self, game, pi, needed, best_rid):
         """Cards of each color still needed for planned colored routes."""
         need = [0] * 8
+        routes = game.board.routes
         for key in needed:
             rid = best_rid.get(key)
-            if rid is not None and ROUTES[rid].color != GRAY:
-                need[ROUTES[rid].color] += ROUTES[rid].length
+            if rid is not None and routes[rid].color != GRAY:
+                need[routes[rid].color] += routes[rid].length
         return need
 
     def _filler_claim(self, game, pi, claims, spare, needed, best_rid):
         """Longest claimable route we can afford without starving our tickets."""
         p = game.players[pi]
-        my_cities = {c for rid in p.routes for c in (ROUTES[rid].a, ROUTES[rid].b)}
+        routes = game.board.routes
+        my_cities = {c for rid in p.routes for c in (routes[rid].a, routes[rid].b)}
         best, best_score = None, -1
         for rid, acts in claims.items():
-            r = ROUTES[rid]
+            r = routes[rid]
             if r.length > spare:
                 continue
             score = r.length * 10
@@ -254,8 +258,9 @@ class HeuristicBot:
         hand = game.players[pi].hand
         demand = self._color_demand(game, pi, needed, best_rid)
         deficit = [max(0, demand[c] - hand[c]) for c in range(8)]
-        gray_len = max((ROUTES[EDGES[k][0]].length for k in needed
-                        if best_rid.get(k) is not None and ROUTES[best_rid[k]].color == GRAY),
+        routes, edges = game.board.routes, game.board.edges
+        gray_len = max((routes[edges[k][0]].length for k in needed
+                        if best_rid.get(k) is not None and routes[best_rid[k]].color == GRAY),
                        default=0)
         gray_color = max(range(8), key=lambda c: (hand[c] - demand[c]))
 
@@ -300,7 +305,7 @@ class HeuristicBot:
             extra = total - base_total
             val = 0
             for t in keep:
-                pts = TICKETS[t][2]
+                pts = game.board.tickets[t][2]
                 val += pts if t in ok else -pts
             # Risk of not finishing grows with the trains still to lay.
             val -= self.cfg["ticket_risk"] * extra * (total / max(trains, 1))
@@ -312,24 +317,39 @@ class HeuristicBot:
 
     def _solo_cost(self, game, pi, t):
         costs, _ = self._edge_costs(game, pi)
-        a, b, _ = TICKETS[t]
-        return self._shortest_path(a, b, costs)[0]
+        a, b, _ = game.board.tickets[t]
+        return self._shortest_path(a, b, costs, game.board.neighbors)[0]
 
 
-def make_bot(kind, seed=None):
+MODELS = Path(__file__).resolve().parent.parent / "models"
+
+
+def model_for(board="usa"):
+    """The network the Expert and Master play with on a board: the USA-trained Expert on
+    the USA map, the board-independent graph network anywhere else."""
+    if board == "usa":
+        return MODELS / "expert.pt"
+    from .data import BOARDS
+    from .ai.graph import fits  # needs PyTorch, so only imported when used
+    return MODELS / "graph.pt" if fits(BOARDS[board]) else None
+
+
+def make_bot(kind, seed=None, board="usa"):
     if kind == "random":
         return RandomBot(seed)
     if kind == "expert":
         from .ai.model import NNBot  # needs PyTorch, so only imported when used
-        return NNBot(seed=seed)
+        return NNBot(path=model_for(board), seed=seed)
     if kind == "master":
         from .ai.search import SearchBot  # the Expert network plus look-ahead search
-        return SearchBot(seed=seed, think=3.0)  # keep moves snappy in the game
+        return SearchBot(path=model_for(board), seed=seed, think=3.0)  # keep moves snappy
     return HeuristicBot(kind, seed)
 
 
-def bot_levels():
+def bot_levels(board="usa"):
     """Difficulty levels on offer; Expert and Master appear once a trained network exists."""
-    from pathlib import Path
-    expert = Path(__file__).resolve().parent.parent / "models" / "expert.pt"
-    return ["easy", "medium", "hard"] + (["expert", "master"] if expert.exists() else [])
+    try:
+        path = model_for(board)
+    except ImportError:  # no PyTorch: rule-based bots only
+        path = None
+    return ["easy", "medium", "hard"] + (["expert", "master"] if path and path.exists() else [])

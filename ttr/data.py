@@ -1,9 +1,12 @@
-"""Static map data for Ticket to Ride (USA base game, 2015 rules).
+"""Static map data for Ticket to Ride (2015 rules): the USA board, and any other boards.
 
-Cities carry real latitude/longitude so the UI can draw them on a real map
+USA cities carry real latitude/longitude so the UI can draw them on a real map
 (Duluth sits at St. Paul's position, matching the official board).
 Routes list both halves of a double route as separate entries; `pair` links them.
+Other boards are Board objects too (see board_from_spec and LOCAL_BOARDS).
 """
+
+from pathlib import Path
 
 # Card colors. Index 8 is the Locomotive (wild).
 COLORS = ["purple", "white", "blue", "yellow", "orange", "black", "red", "green"]
@@ -154,11 +157,12 @@ class Route:
         self.color = color  # 0..7 or GRAY
         self.pair = pair  # id of the other half of a double route, or None
 
-    def to_dict(self):
+    def to_dict(self, names=None):
+        names = names or CITY_NAMES
         return {
             "id": self.id,
-            "a": CITY_NAMES[self.a],
-            "b": CITY_NAMES[self.b],
+            "a": names[self.a],
+            "b": names[self.b],
             "length": self.length,
             "color": "gray" if self.color == GRAY else COLORS[self.color],
             "pair": self.pair,
@@ -169,10 +173,11 @@ def _color_index(name):
     return GRAY if name == "gray" else COLORS.index(name)
 
 
-def _build_routes():
+def _build_routes(specs=None, index=None):
+    specs, index = specs or _ROUTE_SPECS, index or CITY_INDEX
     routes = []
-    for a, b, length, color in _ROUTE_SPECS:
-        ia, ib = CITY_INDEX[a], CITY_INDEX[b]
+    for a, b, length, color in specs:
+        ia, ib = index[a], index[b]
         if isinstance(color, tuple):
             r1 = Route(len(routes), ia, ib, length, _color_index(color[0]))
             r2 = Route(len(routes) + 1, ia, ib, length, _color_index(color[1]))
@@ -266,14 +271,133 @@ GAME_MODES = {
 }
 
 
-def map_json():
-    """Everything the UI needs to draw the board."""
-    return {
-        "cities": [{"name": n, "lat": CITIES[n][0], "lon": CITIES[n][1]} for n in CITY_NAMES],
-        "routes": [r.to_dict() for r in ROUTES],
-        "tickets": [
-            {"id": i, "a": CITY_NAMES[a], "b": CITY_NAMES[b], "points": p}
-            for i, (a, b, p) in enumerate(TICKETS)
-        ],
-        "colors": COLORS,
-    }
+STANDARD_DEAL = {"setup_draw": 3, "setup_keep": 2, "draw": 3, "draw_keep": 1, "globetrotter": 0}
+
+
+class Board:
+    """One map: its cities, routes, tickets, the game modes it offers, and how to draw it.
+
+    The module-level CITY_NAMES, ROUTES, TICKETS, ... above are the USA board's, kept for
+    code that only ever plays the USA map. A game keeps its board as Game.board; a board
+    is never copied (deepcopy and pickling keep or look up the one shared instance).
+    """
+
+    def __init__(self, key, title, cities, routes, tickets, modes, layout, size=None,
+                 color_style=None, trains=TRAINS_PER_PLAYER, ui=None):
+        self.key, self.title = key, title
+        self.cities = cities              # name -> (lat, lon) for "geo", (x, y) for "xy"
+        self.city_names = list(cities)
+        self.city_index = {n: i for i, n in enumerate(self.city_names)}
+        self.routes = routes
+        self.tickets = tickets            # (city index, city index, points)
+        self.modes = modes                # mode name -> rules (see GAME_MODES)
+        self.layout, self.size = layout, size
+        self.color_style = color_style or {}  # color -> (label, fill) where this board differs
+        self.trains = trains
+        self.ui = ui or {}                # drawing details for the browser (labels, landmarks)
+        # City pair -> route ids (a double route has two), and each city's neighbors.
+        self.edges = {}
+        for r in routes:
+            self.edges.setdefault((min(r.a, r.b), max(r.a, r.b)), []).append(r.id)
+        self.edge_keys = list(self.edges)
+        self.neighbors = {c: [] for c in range(len(self.city_names))}
+        for k in self.edge_keys:
+            self.neighbors[k[0]].append((k[1], k))
+            self.neighbors[k[1]].append((k[0], k))
+        self.index = len(BOARDS)          # small number naming the board in network inputs
+        BOARDS[key] = self
+
+    def card_label(self, c):
+        """Name of card type c as this board shows it (e.g. "pink" for purple)."""
+        if c == LOCO:
+            return "locomotive"
+        style = self.color_style.get(COLORS[c])
+        return style[0].lower() if style else COLORS[c]
+
+    def __reduce__(self):
+        return (get_board, (self.key,))
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def to_json(self):
+        """Everything the UI needs to draw the board."""
+        names = self.city_names
+        if self.layout == "geo":
+            cities = [{"name": n, "lat": self.cities[n][0], "lon": self.cities[n][1]} for n in names]
+        else:
+            cities = [{"name": n, "x": self.cities[n][0], "y": self.cities[n][1]} for n in names]
+        return {
+            "board": self.key, "title": self.title, "layout": self.layout, "size": self.size,
+            "cities": cities,
+            "routes": [r.to_dict(names) for r in self.routes],
+            "tickets": [{"id": i, "a": names[a], "b": names[b], "points": p}
+                        for i, (a, b, p) in enumerate(self.tickets)],
+            "colors": COLORS,
+            "color_style": self.color_style,
+            "modes": list(self.modes),
+            "ui": self.ui,
+        }
+
+
+BOARDS = {}
+
+
+def get_board(key):
+    return BOARDS[key]
+
+
+USA = Board("usa", "USA", CITIES, ROUTES, TICKETS, GAME_MODES, "geo")
+
+
+def board_from_spec(key, spec):
+    """Build a board from a plain description (a module or any object with these fields):
+
+        TITLE    name shown in the game
+        SIZE     (width, height) of the drawing; CITIES positions are in these units
+        CITIES   {name: (x, y)}
+        ROUTES   [(city, city, length, color)]; a pair of colors is a double route;
+                 colors are the card colors (purple, white, ..., green) or "gray"
+        TICKETS  [(city, city, points)]
+    optional:
+        TRAINS (45), DEAL (STANDARD_DEAL), COLOR_STYLE ({color: (label, fill)}),
+        CAR_PITCH (36), LABELS ({city: [dx, dy, anchor]}), DECOR ({"parks", "roads"}),
+        SHAPES ({"city|city": bend or {"bend", "via", "ends"}}) - see web/app.js
+    """
+    index = {n: i for i, n in enumerate(spec.CITIES)}
+    tickets = [(index[a], index[b], pts) for a, b, pts in spec.TICKETS]
+    modes = {"standard": {"tickets": list(range(len(tickets))), **getattr(spec, "DEAL", STANDARD_DEAL)}}
+    ui = {"car_pitch": getattr(spec, "CAR_PITCH", 36), "labels": getattr(spec, "LABELS", {}),
+          "decor": getattr(spec, "DECOR", {}), "shapes": getattr(spec, "SHAPES", {})}
+    return Board(key, spec.TITLE, spec.CITIES, _build_routes(spec.ROUTES, index), tickets, modes, "xy",
+                 size=spec.SIZE, color_style=getattr(spec, "COLOR_STYLE", {}),
+                 trains=getattr(spec, "TRAINS", TRAINS_PER_PLAYER), ui=ui)
+
+
+# Boards kept only on this computer (say, a map of your own town): each
+# ttr/local_boards/<key>.py describes one, as in board_from_spec. That folder is
+# left out of the public repository, so it may be missing or empty.
+LOCAL_BOARDS = Path(__file__).resolve().parent / "local_boards"
+
+
+def _load_local_boards():
+    import importlib.util
+    import sys
+    for path in sorted(LOCAL_BOARDS.glob("*.py")):
+        if path.stem.startswith("_") or path.stem in BOARDS:
+            continue
+        try:
+            loader = importlib.util.spec_from_file_location(f"ttr.local_boards.{path.stem}", path)
+            spec = importlib.util.module_from_spec(loader)
+            loader.loader.exec_module(spec)
+            board_from_spec(path.stem, spec)
+        except Exception as e:  # a broken board file shouldn't stop the game
+            print(f"Skipping board {path.name}: {e!r}", file=sys.stderr)
+
+
+_load_local_boards()
+
+
+def map_json(board="usa"):
+    """Everything the UI needs to draw a board."""
+    return BOARDS[board].to_json()

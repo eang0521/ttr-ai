@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .bots import bot_levels, make_bot
-from .data import CITY_NAMES, GAME_MODES, ROUTES, TICKETS, map_json
+from .data import BOARDS, map_json
 from .engine import CHOOSE_TICKETS, GAME_OVER, SECOND_DRAW, SETUP_TICKETS, Game
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -26,11 +26,12 @@ SAVE_PATH = Path(os.environ.get("TTR_SAVE") or
 
 
 class Session:
-    def __init__(self, seats, seed=None, mode="standard"):
+    def __init__(self, seats, seed=None, mode="standard", board="usa"):
         self.seats = seats  # [{"name", "type"}], type "human" or a bot level
         self.seed = seed if seed is not None else random.randrange(10**9)
         self.mode = mode  # "standard" or "mega" (see data.GAME_MODES)
-        self.game = Game(len(seats), seed=self.seed, mode=mode)
+        self.board = board  # a key of data.BOARDS
+        self.game = Game(len(seats), seed=self.seed, mode=mode, board=board)
         # Every action taken, as (player, action). The engine is deterministic given the
         # seed, so replaying a prefix of this rebuilds any earlier position for review.
         self.history = []
@@ -39,13 +40,15 @@ class Session:
         self._setup()
 
     def _setup(self):
-        self.bots = {i: make_bot(s["type"]) for i, s in enumerate(self.seats) if s["type"] != "human"}
+        self.bots = {i: make_bot(s["type"], board=self.board)
+                     for i, s in enumerate(self.seats) if s["type"] != "human"}
         self.lock = threading.Lock()
 
     # Saved games keep only the seats and the game; bots are rebuilt on load.
     def __getstate__(self):
         return {"seats": self.seats, "game": self.game, "seed": self.seed, "history": self.history,
-                "turn_ends": self.turn_ends, "replayable": self.replayable, "mode": self.mode}
+                "turn_ends": self.turn_ends, "replayable": self.replayable, "mode": self.mode,
+                "board": self.board}
 
     def __setstate__(self, state):
         self.seats, self.game = state["seats"], state["game"]
@@ -55,6 +58,7 @@ class Session:
         self.turn_ends = state.get("turn_ends", [])
         self.replayable = state.get("replayable", False)
         self.mode = state.get("mode", "standard")
+        self.board = state.get("board", "usa")
         self._setup()
 
     def save(self):
@@ -86,7 +90,7 @@ class Session:
 
     def replay(self, turn):
         """The game as it stood after `turn` complete turns (0 = the opening deal)."""
-        g = Game(len(self.seats), seed=self.seed, mode=self.mode)
+        g = Game(len(self.seats), seed=self.seed, mode=self.mode, board=self.board)
         for _, action in self.history[:self.turn_ends[turn - 1] if turn else 0]:
             g.step(action, validate=False)
         return g
@@ -107,9 +111,11 @@ class Session:
         n_actions = (self.turn_ends[turn - 1] if turn else 0) if review else len(self.history)
         over = g.phase == GAME_OVER
 
+        names = g.board.city_names
+
         def ticket(t, pi):
-            a, b, pts = TICKETS[t]
-            return {"id": t, "a": CITY_NAMES[a], "b": CITY_NAMES[b], "points": pts,
+            a, b, pts = g.board.tickets[t]
+            return {"id": t, "a": names[a], "b": names[b], "points": pts,
                     "done": g.ticket_done(pi, t)}
 
         players = []
@@ -151,7 +157,7 @@ class Session:
 
         return {
             "players": players, "you": you, "legal": legal,
-            "current": g.current, "phase": g.phase, "mode": g.mode,
+            "current": g.current, "phase": g.phase, "mode": g.mode, "board": g.board.key,
             "current_is_bot": self.is_bot(g.current),
             "face_up": g.face_up, "deck_size": len(g.deck), "discard_size": len(g.discard),
             "ticket_deck_size": len(g.ticket_deck), "route_owner": g.route_owner,
@@ -175,25 +181,29 @@ SESSION = None
 
 
 class Analyst:
-    """Runs the Expert network's move analysis; reloads it when training saves a new one."""
+    """Runs the Expert network's move analysis (on other boards, the graph network's);
+    reloads a network when training saves a new one."""
 
     def __init__(self):
+        self.path = None
         self.net = None
         self.pool = None
         self.mtime = None
         self.lock = threading.Lock()
 
-    def ready(self):
-        from .ai.model import EXPERT_PATH, load
-        if not EXPERT_PATH.exists():
+    def ready(self, board):
+        from .ai.model import load
+        from .bots import model_for
+        path = model_for(board)
+        if path is None or not path.exists():
             return False
-        mtime = EXPERT_PATH.stat().st_mtime
-        if mtime != self.mtime:
+        mtime = path.stat().st_mtime
+        if path != self.path or mtime != self.mtime:
             try:
-                self.net = load(EXPERT_PATH)
+                net = load(path)
             except Exception:  # file mid-write by the trainer; keep the old one
-                return self.net is not None
-            self.mtime = mtime
+                return self.net is not None and path == self.path
+            self.net, self.path, self.mtime = net, path, mtime
             if self.pool is not None:
                 self.pool.terminate()
                 self.pool = None
@@ -203,16 +213,15 @@ class Analyst:
         if self.pool is None:
             import multiprocessing
             import os
-            from .ai.model import EXPERT_PATH
             from .ai.search import worker_init
             self.pool = multiprocessing.Pool(max(2, (os.cpu_count() or 4) - 2),
-                                             initializer=worker_init, initargs=(str(EXPERT_PATH),))
+                                             initializer=worker_init, initargs=(str(self.path),))
         return self.pool
 
     def hint(self, game, viewer):
         from .ai.search import describe, instinct
         with self.lock:
-            if not self.ready():
+            if not self.ready(game.board.key):
                 return {"error": "No trained Expert model yet."}
             value, picks = instinct(game, viewer, self.net)
         moves = []
@@ -224,7 +233,7 @@ class Analyst:
     def analyze(self, game, viewer, sims):
         from .ai.search import analyze
         with self.lock:
-            if not self.ready():
+            if not self.ready(game.board.key):
                 return {"error": "No trained Expert model yet."}
             return analyze(game, viewer, self.net, self.get_pool(), sims=sims)
 
@@ -252,7 +261,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == "/api/map":
-            return self._json({**map_json(), "bot_levels": bot_levels(), "player_colors": PLAYER_COLORS})
+            board = parse_qs(url.query).get("board", ["usa"])[0]
+            if board not in BOARDS:
+                return self._json({"error": f"unknown board {board}"}, 400)
+            boards = [{"key": b.key, "title": b.title, "modes": list(b.modes), "bot_levels": bot_levels(b.key)}
+                      for b in BOARDS.values()]
+            return self._json({**map_json(board), "bot_levels": bot_levels(board), "boards": boards,
+                               "player_colors": PLAYER_COLORS})
         if url.path == "/api/state":
             if SESSION is None:
                 return self._json({"no_game": True})
@@ -311,19 +326,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(ANALYST.analyze(game, viewer, sims))
             if url.path == "/api/new":
                 seats = body["seats"]
+                board = body.get("board", "usa")
+                if board not in BOARDS:
+                    raise ValueError(f"unknown board {board}")
                 if not 2 <= len(seats) <= 5:
                     raise ValueError("2-5 players")
+                levels = bot_levels(board)
                 for s in seats:
-                    if s["type"] != "human" and s["type"] not in bot_levels():
+                    if s["type"] != "human" and s["type"] not in levels:
                         raise ValueError(f"unknown seat type {s['type']}")
                 # Each seat keeps the color it was shown with, even if the order is shuffled.
                 seats = [{**s, "color": PLAYER_COLORS[i]} for i, s in enumerate(seats)]
                 if body.get("random_order"):
                     random.shuffle(seats)
                 mode = body.get("mode", "standard")
-                if mode not in GAME_MODES:
-                    raise ValueError(f"unknown game mode {mode}")
-                SESSION = Session(seats, body.get("seed"), mode)
+                if mode not in BOARDS[board].modes:
+                    raise ValueError(f"unknown game mode {mode} for this board")
+                SESSION = Session(seats, body.get("seed"), mode, board)
                 SESSION.save()
                 return self._json({"ok": True})
             if SESSION is None:

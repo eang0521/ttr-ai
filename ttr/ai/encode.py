@@ -17,13 +17,16 @@ Action menu (ACTION_SIZE entries, illegal ones masked out):
 
 This network's inputs know only the 30 standard tickets by name; in the Mega Game it
 still sees what its tickets need (the planning features) but not which ones they are.
+Its route inputs are tied to the USA map's route numbers, so it plays only the USA
+board; the graph network (graph.py) reuses the shared pieces here on any board with the
+same number of cities and routes.
 """
 
 from functools import lru_cache
 
 import numpy as np
 
-from ..data import LOCO, ROUTES, STANDARD_TICKETS, TICKETS
+from ..data import BOARDS, LOCO, ROUTES, STANDARD_TICKETS, USA
 from ..engine import CHOOSE_TICKETS, MAIN, SECOND_DRAW, SETUP_TICKETS, longest_path, trails
 from ..planning import edge_costs, plan, unfinished
 
@@ -77,8 +80,9 @@ def encode(game, pi):
     todo = unfinished(game, pi)
     needed, total, feasible, _, tcost = plan(game, pi, todo, costs)
 
+    board = game.board
     o = OFF["own"]
-    for r in ROUTES:
+    for r in board.routes:
         w = owner[r.id]
         if w == -1:
             if game.route_open_to(r.id, pi):
@@ -115,7 +119,7 @@ def encode(game, pi):
         obs[b + 5:b + 14] = np.array(q.known_hand, np.float32) / 6
 
     for t in me.tickets:
-        if t >= NT:
+        if t >= NT or board is not USA:
             continue
         obs[OFF["held"] + t] = 1
         if t not in todo:
@@ -127,12 +131,12 @@ def encode(game, pi):
 
     if me.pending:
         for k, t in enumerate(me.pending[:3]):
-            if t < NT:
+            if t < NT and board is USA:
                 obs[OFF["pend"] + k * NT + t] = 1
             _, tot2, ok2, _, _ = plan(game, pi, todo + [t], costs)
             b = OFF["pendf"] + k * 4
             obs[b] = 1
-            obs[b + 1] = TICKETS[t][2] / 22
+            obs[b + 1] = board.tickets[t][2] / 22
             obs[b + 2] = (tot2 - total) / 45
             obs[b + 3] = 1 if t in ok2 else 0
 
@@ -142,7 +146,7 @@ def encode(game, pi):
         rid = best_rid.get(key)
         if rid is None:
             continue
-        r = ROUTES[rid]
+        r = board.routes[rid]
         obs[o + (8 if r.color < 0 else r.color)] += r.length / 20
 
     o = OFF["global"]
@@ -176,16 +180,17 @@ def encode(game, pi):
 
 def route_gains(game, q):
     """Player q's longest path, and how much each open route would lengthen it."""
-    return _gains(tuple(game.players[q].routes), tuple(game.route_owner), game.num_players, q)
+    return _gains(game.board.key, tuple(game.players[q].routes), tuple(game.route_owner),
+                  game.num_players, q)
 
 
 @lru_cache(maxsize=4096)
-def _gains(routes, owner, n, q):
+def _gains(board, routes, owner, n, q):
     # Cached on the board's ownership, which only changes when someone claims a route.
-    best, start, piece = _network(routes)
+    best, start, piece = _network(board, routes)
     routes = list(routes)
     gain = {}
-    for r in ROUTES:
+    for r in BOARDS[board].routes:
         if owner[r.id] != -1 or (r.length <= best and r.a not in start and r.b not in start):
             continue
         # Double routes: with 2-3 players only one of the pair may be used, and never
@@ -193,7 +198,7 @@ def _gains(routes, owner, n, q):
         if r.pair is not None and owner[r.pair] != -1 and (n <= 3 or owner[r.pair] == q):
             continue
         if r.a in start and r.b in start and piece[r.a] == piece[r.b]:
-            new = _longest(tuple(sorted(routes + [r.id])))  # closes a loop: count it exactly
+            new = _longest(board, tuple(sorted(routes + [r.id])))  # closes a loop: count it exactly
         else:
             new = r.length + start.get(r.a, 0) + start.get(r.b, 0)
         if new > best:
@@ -202,15 +207,15 @@ def _gains(routes, owner, n, q):
 
 
 @lru_cache(maxsize=65536)
-def _longest(routes):
-    return longest_path(list(routes))
+def _longest(board, routes):
+    return longest_path(list(routes), BOARDS[board].routes)
 
 
 @lru_cache(maxsize=4096)
-def _network(routes):
+def _network(board, routes):
     """Longest path, longest path from each city, and each city's connected piece.
     A player's routes change only when they claim one, so this is cached."""
-    best, start = trails(list(routes))
+    best, start = trails(list(routes), BOARDS[board].routes)
     parent = {}
 
     def find(c):
@@ -218,7 +223,7 @@ def _network(routes):
             c = parent[c]
         return c
     for rid in routes:
-        r = ROUTES[rid]
+        r = BOARDS[board].routes[rid]
         a, b = find(r.a), find(r.b)
         if a != b:
             parent[a] = b

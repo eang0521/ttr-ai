@@ -1,4 +1,4 @@
-"""Rules engine for Ticket to Ride (USA base game, 2015 rules).
+"""Rules engine for Ticket to Ride (2015 rules), on the USA map or another board.
 
 Headless and deterministic for a given seed, so it can drive both the UI and
 self-play training. Actions are plain tuples:
@@ -15,8 +15,8 @@ import random
 from collections import defaultdict
 
 from .data import (
-    CARDS_PER_COLOR, CITY_NAMES, COLORS, GAME_MODES, GRAY, LOCO, LONGEST_PATH_BONUS,
-    NUM_CARD_TYPES, NUM_LOCOS, ROUTE_POINTS, ROUTES, TICKETS, TRAINS_PER_PLAYER,
+    BOARDS, CARDS_PER_COLOR, COLORS, GRAY, LOCO, LONGEST_PATH_BONUS, NUM_CARD_TYPES, NUM_LOCOS,
+    ROUTE_POINTS, ROUTES, TRAINS_PER_PLAYER, USA,
 )
 
 SETUP_TICKETS = "setup_tickets"  # choosing the opening tickets (keep >= 2; Mega: 3 of 5)
@@ -33,10 +33,10 @@ def card_name(c):
 
 
 class Player:
-    def __init__(self, index):
+    def __init__(self, index, trains=TRAINS_PER_PLAYER):
         self.index = index
         self.hand = [0] * NUM_CARD_TYPES
-        self.trains = TRAINS_PER_PLAYER
+        self.trains = trains
         self.route_score = 0
         self.routes = []
         self.tickets = []
@@ -51,12 +51,16 @@ class Player:
 
 class Game:
     mode = "standard"  # games saved before modes existed are standard games
+    board = USA        # ... and games saved before boards existed are on the USA map
 
-    def __init__(self, num_players=2, seed=None, mode="standard"):
+    def __init__(self, num_players=2, seed=None, mode="standard", board="usa"):
         if not 2 <= num_players <= 5:
             raise ValueError("Ticket to Ride supports 2-5 players")
-        if mode not in GAME_MODES:
-            raise ValueError(f"unknown game mode {mode}")
+        if board not in BOARDS:
+            raise ValueError(f"unknown board {board}")
+        self.board = BOARDS[board]
+        if mode not in self.board.modes:
+            raise ValueError(f"unknown game mode {mode} for the {self.board.title} board")
         self.mode = mode
         self.num_players = num_players
         self.rng = random.Random(seed)
@@ -69,8 +73,8 @@ class Game:
         self.ticket_deck = list(self.rules["tickets"])
         self.rng.shuffle(self.ticket_deck)
 
-        self.route_owner = [-1] * len(ROUTES)
-        self.players = [Player(i) for i in range(num_players)]
+        self.route_owner = [-1] * len(self.board.routes)
+        self.players = [Player(i, self.board.trains) for i in range(num_players)]
         for p in self.players:
             for _ in range(4):
                 p.hand[self._draw_card()] += 1
@@ -117,8 +121,8 @@ class Game:
 
     @property
     def rules(self):
-        """The rules that differ by game mode (see data.GAME_MODES)."""
-        return GAME_MODES[self.mode]
+        """The rules that differ by game mode (see data.GAME_MODES and Board.modes)."""
+        return self.board.modes[self.mode]
 
     def min_keep(self):
         """Fewest of the tickets on offer that the current player may keep."""
@@ -137,7 +141,7 @@ class Game:
         """Can player pi claim this route, ignoring cards and trains?"""
         if self.route_owner[rid] != -1:
             return False
-        pair = ROUTES[rid].pair
+        pair = self.board.routes[rid].pair
         if pair is not None and self.route_owner[pair] != -1:
             if self.num_players <= 3 or self.route_owner[pair] == pi:
                 return False
@@ -146,7 +150,7 @@ class Game:
     def claim_options(self, pi, rid):
         """All legal (color, n_locos) payments for player pi on route rid."""
         p = self.players[pi]
-        r = ROUTES[rid]
+        r = self.board.routes[rid]
         if p.trains < r.length or not self.route_open_to(rid, pi):
             return []
         L, locos = r.length, p.hand[LOCO]
@@ -171,7 +175,7 @@ class Game:
         hand, locos, trains = p.hand, p.hand[LOCO], p.trains
         owner = self.route_owner
         out = []
-        for r in ROUTES:
+        for r in self.board.routes:
             L = r.length
             if L > trains or owner[r.id] != -1:
                 continue
@@ -190,7 +194,7 @@ class Game:
 
     def cheapest_claim(self, pi, rid, color):
         """Engine action paying for route rid in `color` with the fewest locomotives."""
-        L = ROUTES[rid].length
+        L = self.board.routes[rid].length
         if color == LOCO:
             return ("claim", rid, LOCO, L)
         return ("claim", rid, color, max(0, L - self.players[pi].hand[color]))
@@ -202,6 +206,8 @@ class Game:
         p = self.players[pi]
 
         if self.phase in (SETUP_TICKETS, CHOOSE_TICKETS):
+            if not p.pending:  # a small ticket deck ran out before this player was dealt any
+                return [("keep_tickets", ())]
             return [("keep_tickets", keep) for keep in _subsets(p.pending, self.min_keep())]
 
         if self.phase == SECOND_DRAW:
@@ -215,7 +221,7 @@ class Game:
                 actions.append(("draw_face_up", slot))
         if self.ticket_deck:
             actions.append(("draw_tickets",))
-        for rid in range(len(ROUTES)):
+        for rid in range(len(self.board.routes)):
             for c, n in self.claim_options(pi, rid):
                 actions.append(("claim", rid, c, n))
         if not actions:
@@ -275,7 +281,7 @@ class Game:
 
         if kind == "claim":
             _, rid, color, n_locos = action
-            r = ROUTES[rid]
+            r = self.board.routes[rid]
             n_color = r.length - n_locos
             if color != LOCO:
                 p.hand[color] -= n_color
@@ -290,7 +296,7 @@ class Game:
             p.route_score += ROUTE_POINTS[r.length]
             p.routes.append(rid)
             self.route_owner[rid] = pi
-            self._log(pi, f"claimed {CITY_NAMES[r.a]} - {CITY_NAMES[r.b]} ({r.length})")
+            self._log(pi, f"claimed {self.board.city_names[r.a]} - {self.board.city_names[r.b]} ({r.length})")
             self._end_turn()
             return
 
@@ -301,7 +307,7 @@ class Game:
             p.hand[card] += 1
             p.known_hand[card] += 1
             self._refill_face_up()
-            self._log(pi, f"took a face-up {card_name(card)}")
+            self._log(pi, f"took a face-up {self.board.card_label(card)}")
             if card == LOCO or self.phase == SECOND_DRAW:
                 self._end_turn()
             else:
@@ -354,12 +360,12 @@ class Game:
     # -------------------------------------------------------------- scoring
 
     def ticket_done(self, pi, tid):
-        a, b, _ = TICKETS[tid]
-        return connected(self.players[pi].routes, a, b)
+        a, b, _ = self.board.tickets[tid]
+        return connected(self.players[pi].routes, a, b, self.board.routes)
 
     def _finish(self):
         self.phase = GAME_OVER
-        longest = [longest_path(p.routes) for p in self.players]
+        longest = [longest_path(p.routes, self.board.routes) for p in self.players]
         best = max(longest)
         completed = [[t for t in p.tickets if self.ticket_done(p.index, t)] for p in self.players]
         most = max(len(c) for c in completed)
@@ -367,7 +373,8 @@ class Game:
         for p in self.players:
             done = completed[p.index]
             failed = [t for t in p.tickets if t not in done]
-            ticket_pts = sum(TICKETS[t][2] for t in done) - sum(TICKETS[t][2] for t in failed)
+            tickets = self.board.tickets
+            ticket_pts = sum(tickets[t][2] for t in done) - sum(tickets[t][2] for t in failed)
             bonus = LONGEST_PATH_BONUS if best > 0 and longest[p.index] == best else 0
             # Globetrotter (Mega Game): the most completed tickets, shared on a tie.
             globe = self.rules["globetrotter"] if most > 0 and len(done) == most else 0
@@ -407,7 +414,7 @@ def _subsets(items, min_size):
     return out
 
 
-def connected(route_ids, a, b):
+def connected(route_ids, a, b, routes=ROUTES):
     parent = {}
 
     def find(x):
@@ -416,18 +423,18 @@ def connected(route_ids, a, b):
         return x
 
     for rid in route_ids:
-        r = ROUTES[rid]
+        r = routes[rid]
         ra, rb = find(r.a), find(r.b)
         if ra != rb:
             parent[ra] = rb
     return find(a) == find(b)
 
 
-def longest_path(route_ids):
+def longest_path(route_ids, routes=ROUTES):
     """Length in trains of the longest continuous path (routes used once each)."""
     adj = defaultdict(list)
     for i, rid in enumerate(route_ids):
-        r = ROUTES[rid]
+        r = routes[rid]
         adj[r.a].append((i, r.b, r.length))
         adj[r.b].append((i, r.a, r.length))
     used = [False] * len(route_ids)
@@ -448,11 +455,11 @@ def longest_path(route_ids):
     return best
 
 
-def trails(route_ids):
+def trails(route_ids, routes=ROUTES):
     """(longest path, {city: longest path starting at that city}) for a set of routes."""
     adj = defaultdict(list)
     for i, rid in enumerate(route_ids):
-        r = ROUTES[rid]
+        r = routes[rid]
         adj[r.a].append((i, r.b, r.length))
         adj[r.b].append((i, r.a, r.length))
     used = [False] * len(route_ids)

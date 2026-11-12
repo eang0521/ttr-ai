@@ -15,26 +15,23 @@ import time
 import numpy as np
 import torch
 
-from ..data import CARDS_PER_COLOR, CITY_NAMES, COLORS, LOCO, NUM_LOCOS, ROUTES, TICKETS
-from ..engine import CHOOSE_TICKETS, GAME_OVER, MAIN, SETUP_TICKETS, card_name
+from ..data import CARDS_PER_COLOR, LOCO, NUM_LOCOS
+from ..engine import CHOOSE_TICKETS, GAME_OVER, MAIN, SETUP_TICKETS
 from ..planning import edge_costs, shortest_path
 from .encode import decode
 
-_FULL_COSTS = None
 _BASE = {}
 _WEIGHTS = {}
 
 
-def _base_cost(t):
+def _base_cost(board, t):
     """Trains needed for a ticket on an empty board."""
-    global _FULL_COSTS
-    if t not in _BASE:
-        if _FULL_COSTS is None:
-            from ..planning import EDGES
-            _FULL_COSTS = {k: ROUTES[rids[0]].length for k, rids in EDGES.items()}
-        a, b, _ = TICKETS[t]
-        _BASE[t] = shortest_path(a, b, _FULL_COSTS)[0]
-    return _BASE[t]
+    key = (board.key, t)
+    if key not in _BASE:
+        full = {k: board.routes[rids[0]].length for k, rids in board.edges.items()}
+        a, b, _ = board.tickets[t]
+        _BASE[key] = shortest_path(a, b, full, board.neighbors)[0]
+    return _BASE[key]
 
 
 def ticket_weights(game, q, candidates):
@@ -43,17 +40,18 @@ def ticket_weights(game, q, candidates):
         return [1.0] * len(candidates)
     # Depends only on who owns which routes, so it's worked out once per board position
     # rather than once per imagined version of the game.
-    key = (tuple(game.route_owner), game.num_players, q)
+    board = game.board
+    key = (board.key, tuple(game.route_owner), game.num_players, q)
     w = _WEIGHTS.get(key)
     if w is None:
         if len(_WEIGHTS) > 512:
             _WEIGHTS.clear()
         costs, _ = edge_costs(game, q)
         w = []
-        for t in range(len(TICKETS)):
-            a, b, _ = TICKETS[t]
-            now = shortest_path(a, b, costs)[0]
-            covered = 0.0 if math.isinf(now) else max(0.0, 1 - now / _base_cost(t))
+        for t in range(len(board.tickets)):
+            a, b, _ = board.tickets[t]
+            now = shortest_path(a, b, costs, board.neighbors)[0]
+            covered = 0.0 if math.isinf(now) else max(0.0, 1 - now / _base_cost(board, t))
             w.append(math.exp(3 * covered))
         _WEIGHTS[key] = w
     return [w[t] for t in candidates]
@@ -344,20 +342,22 @@ def describe(game, pi, idx):
     """Plain-English label for an action index, plus the route it claims (if any)."""
     a = decode(game, pi, idx)
     kind = a[0]
+    board = game.board
+    names = board.city_names
     if kind == "draw_deck":
         return "Draw a card from the deck", None
     if kind == "draw_face_up":
-        return f"Take the face-up {card_name(game.face_up[a[1]])}", None
+        return f"Take the face-up {board.card_label(game.face_up[a[1]])}", None
     if kind == "draw_tickets":
         return "Draw destination tickets", None
     if kind == "pass":
         return "Pass", None
     if kind == "keep_tickets":
-        names = [f"{CITY_NAMES[TICKETS[t][0]]}–{CITY_NAMES[TICKETS[t][1]]}" for t in a[1]]
-        return "Keep " + ", ".join(names), None
+        kept = [f"{names[board.tickets[t][0]]}–{names[board.tickets[t][1]]}" for t in a[1]]
+        return "Keep " + ", ".join(kept), None
     _, rid, color, n_locos = a
-    r = ROUTES[rid]
+    r = board.routes[rid]
     n = r.length - n_locos
     pay = f"{r.length} locomotives" if color == LOCO else \
-        f"{n} {COLORS[color]}" + (f" + {n_locos} loco" if n_locos else "")
-    return f"Claim {CITY_NAMES[r.a]}–{CITY_NAMES[r.b]} ({pay})", rid
+        f"{n} {board.card_label(color)}" + (f" + {n_locos} loco" if n_locos else "")
+    return f"Claim {names[r.a]}–{names[r.b]} ({pay})", rid

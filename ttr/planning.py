@@ -3,19 +3,15 @@
 import heapq
 from collections import defaultdict
 
-from .data import GRAY, ROUTES, TICKETS
+from .data import GRAY, USA
 
 INF = float("inf")
 
-# City pair -> route ids (a double route has two).
-EDGES = defaultdict(list)
-for _r in ROUTES:
-    EDGES[(min(_r.a, _r.b), max(_r.a, _r.b))].append(_r.id)
-EDGE_KEYS = list(EDGES)
-NEIGHBORS = defaultdict(list)
-for _k in EDGE_KEYS:
-    NEIGHBORS[_k[0]].append((_k[1], _k))
-    NEIGHBORS[_k[1]].append((_k[0], _k))
+# The USA board's city pairs -> route ids (a double route has two); every board carries
+# its own (Board.edges, Board.neighbors), which the functions below use via game.board.
+EDGES = USA.edges
+EDGE_KEYS = USA.edge_keys
+NEIGHBORS = USA.neighbors
 
 
 def edge_costs(game, pi):
@@ -27,7 +23,8 @@ def edge_costs(game, pi):
     costs, best_rid = {}, {}
     hand = game.players[pi].hand
     owner = game.route_owner
-    for key, rids in EDGES.items():
+    routes = game.board.routes
+    for key, rids in game.board.edges.items():
         if any(owner[r] == pi for r in rids):
             costs[key] = 0
             continue
@@ -35,16 +32,16 @@ def edge_costs(game, pi):
         if not open_ids:
             costs[key] = INF
             continue
-        costs[key] = ROUTES[open_ids[0]].length
+        costs[key] = routes[open_ids[0]].length
         if len(open_ids) == 1:
             best_rid[key] = open_ids[0]
         else:
             best_rid[key] = max(open_ids, key=lambda r: (
-                99 if ROUTES[r].color == GRAY else hand[ROUTES[r].color]))
+                99 if routes[r].color == GRAY else hand[routes[r].color]))
     return costs, best_rid
 
 
-def shortest_path(a, b, costs):
+def shortest_path(a, b, costs, neighbors=NEIGHBORS):
     """Dijkstra over city-pair edges. Returns (cost, [edge keys]) or (inf, None)."""
     dist = {a: 0}
     prev = {}
@@ -60,7 +57,7 @@ def shortest_path(a, b, costs):
             return d, path
         if d > dist.get(city, INF):
             continue
-        for other, key in NEIGHBORS[city]:
+        for other, key in neighbors[city]:
             nd = d + costs[key]
             if nd < dist.get(other, INF):
                 dist[other] = nd
@@ -79,9 +76,10 @@ def plan(game, pi, tickets, costs):
     trains = game.players[pi].trains
     needed, used_by, ticket_cost = [], defaultdict(list), {}
     total, feasible = 0, []
-    for t in sorted(tickets, key=lambda t: -TICKETS[t][2]):
-        a, b, _ = TICKETS[t]
-        cost, path = shortest_path(a, b, costs)
+    board = game.board
+    for t in sorted(tickets, key=lambda t: -board.tickets[t][2]):
+        a, b, _ = board.tickets[t]
+        cost, path = shortest_path(a, b, costs, board.neighbors)
         if path is None or total + cost > trains:
             continue
         feasible.append(t)
@@ -108,9 +106,10 @@ def ticket_damage(game, q):
     costs, _ = edge_costs(game, q)
     trains = game.players[q].trains
     out = {}
+    board = game.board
     for t in unfinished(game, q):
-        a, b, pts = TICKETS[t]
-        base, path = shortest_path(a, b, costs)
+        a, b, pts = board.tickets[t]
+        base, path = shortest_path(a, b, costs, board.neighbors)
         if path is None or base > trains:
             continue
         for key in path:
@@ -118,7 +117,7 @@ def ticket_damage(game, q):
                 continue
             blocked = dict(costs)
             blocked[key] = INF
-            alt, _ = shortest_path(a, b, blocked)
+            alt, _ = shortest_path(a, b, blocked, board.neighbors)
             lost = pts if alt > trains else 0
             dmg, pts_lost = out.get(key, (0, 0))
             out[key] = (dmg + (2 * lost if lost else alt - base), pts_lost + lost)
